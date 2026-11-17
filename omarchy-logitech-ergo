@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Small, reversible ERGO K860 integration for Omarchy's Lua configuration."""
+
+import argparse
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+START = '-- BEGIN omarchy-logitech-ergo (managed)'
+END = '-- END omarchy-logitech-ergo (managed)'
+LOADER = f'{START}\nrequire("logitech-ergo")\n{END}\n'
+MODULE = '''-- Managed by omarchy-logitech-ergo. Edit the repository, then reinstall.
+-- The K860 lock key in PC mode sends Super+L.
+-- Omarchy normally uses this chord to cycle workspace layouts.
+o.rebind("SUPER + L", "Lock system", "omarchy system lock")
+'''
+
+
+class SetupError(Exception):
+    pass
+
+
+def strip_loader(text):
+    if START not in text and END not in text:
+        return text
+    if text.count(START) != 1 or text.count(END) != 1 or LOADER not in text:
+        raise SetupError('Managed loader was edited or is malformed; refusing to change bindings.lua.')
+    return text.replace(LOADER, '', 1)
+
+
+def run(command):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise SetupError(f'{command[0]}: {error}') from error
+    if result.returncode:
+        raise SetupError(f'{" ".join(command)} failed:\n{result.stderr or result.stdout}')
+    return result.stdout
+
+
+def reload_config():
+    run(['hyprctl', 'reload'])
+    errors = run(['hyprctl', 'configerrors']).strip()
+    if errors:
+        raise SetupError(f'Hyprland configuration errors:\n{errors}')
+
+
+def backup(paths, root):
+    destination = root / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+    destination.mkdir(parents=True, exist_ok=False)
+    for path in paths:
+        if path.exists():
+            shutil.copy2(path, destination / path.name)
+    print(f'Backup: {destination}')
+
+
+def apply(action, config_home, no_reload=False):
+    directory = config_home / 'hypr'
+    bindings = directory / 'bindings.lua'
+    module = directory / 'logitech-ergo.lua'
+    if not bindings.is_file():
+        raise SetupError(f'{bindings} not found. This tool requires Omarchy with Lua configuration.')
+    if bindings.is_symlink() or module.is_symlink():
+        raise SetupError('Symlinked configuration files are not supported; update your dotfiles directly.')
+    original_bindings = bindings.read_text()
+    original_module = module.read_text() if module.exists() else None
+    if original_module is not None and original_module != MODULE:
+        raise SetupError(f'{module} has custom content; refusing to overwrite or remove it.')
+    clean = strip_loader(original_bindings)
+    updated = clean.rstrip('\n') + '\n\n' + LOADER if action == 'install' else clean
+    target_module = MODULE if action == 'install' else None
+    if original_bindings == updated and original_module == target_module:
+        print(f'Already {"installed" if action == "install" else "uninstalled"}.')
+        return
+    if not no_reload:
+        # Do not blame existing errors on this integration or modify a broken config.
+        errors = run(['hyprctl', 'configerrors']).strip()
+        if errors:
+            raise SetupError(f'Fix existing Hyprland errors first:\n{errors}')
+    backup([bindings, module], config_home / 'omarchy-logitech-ergo' / 'backups')
+    try:
+        if target_module is not None:
+            module.write_text(target_module)
+        bindings.write_text(updated)
+        if target_module is None:
+            module.unlink(missing_ok=True)
+        if not no_reload:
+            reload_config()
+    except (SetupError, OSError):
+        bindings.write_text(original_bindings)
+        if original_module is None:
+            module.unlink(missing_ok=True)
+        else:
+            module.write_text(original_module)
+        if not no_reload:
+            try:
+                reload_config()
+            except SetupError as error:
+                print(f'Rollback reload warning: {error}', file=sys.stderr)
+        raise
+    print(f'{"Installed" if action == "install" else "Uninstalled"}: {bindings}')
+    if no_reload:
+        print('Reload skipped. Run hyprctl reload and hyprctl configerrors in your desktop session.')
+
+
+def configure_keyboard(device):
+    # Hardware settings are separate from the file installer and its rollback.
+    print(run(['solaar', 'config', device, 'multiplatform', 'Windows']).strip())
+    print(run(['solaar', 'config', device, 'fn-swap', 'on']).strip())
+    print('Keyboard: PC/Linux layout, shortcut functions without Fn.')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['install', 'uninstall', 'configure-keyboard'])
+    parser.add_argument('--config-home', type=Path,
+                        default=Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')),
+                        help='configuration root (default: XDG_CONFIG_HOME or ~/.config)')
+    parser.add_argument('--no-reload', action='store_true', help='edit files without contacting Hyprland')
+    parser.add_argument('--device', default='ERGO K860', help='Solaar device name or serial')
+    args = parser.parse_args(argv)
+    try:
+        if args.action == 'configure-keyboard':
+            configure_keyboard(args.device)
+        else:
+            apply(args.action, args.config_home, args.no_reload)
+    except (SetupError, OSError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
